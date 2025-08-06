@@ -95,7 +95,7 @@ class RRD_parser:
         return ts_secs
 
 
-    def get_baseline(self, ds):
+    def get_baseline(self, ds, consolidation="AVERAGE"):
         """ Gets baseline data (mean and stddev for each baseline period) """
         timeshifts = []
         baseline_ts = re.search(r"(\d+)([dwMy])", self.baseline)
@@ -112,7 +112,7 @@ class RRD_parser:
         self.timeshift = timeshifts[0]
         data = []
         for ts in timeshifts:
-            data.append(self.get_rrd_json(ds, ts))
+            data.append(self.get_rrd_json(ds, ts, consolidation))
 
         return data
 
@@ -184,9 +184,9 @@ class RRD_parser:
         return means, std_devs
 
 
-    def get_rrd_json(self, ds, ts=None):
+    def get_rrd_json(self, ds, ts=None, consolidation="AVERAGE"):
         """ gets RRD json from rrd tool """
-        rrd_xport_command = f"rrdtool xport --step {self.step} DEF:data={self.rrd_file}:{ds}:AVERAGE XPORT:data:{ds} --showtime"
+        rrd_xport_command = f"rrdtool xport --step {self.step} DEF:data={self.rrd_file}:{ds}:{consolidation} XPORT:data:{ds} --showtime"
 
         if self.start_time:
             ts_sec = 0
@@ -194,7 +194,7 @@ class RRD_parser:
                 ts_sec = self.get_timeshift(ts)
             start_time = self.start_time - ts_sec
             end_time = self.end_time - ts_sec
-            rrd_xport_command = f"rrdtool xport DEF:data={self.rrd_file}:{ds}:AVERAGE XPORT:data:{ds} --showtime --start {start_time} --end {end_time}"
+            rrd_xport_command = f"rrdtool xport DEF:data={self.rrd_file}:{ds}:{consolidation} XPORT:data:{ds} --showtime --start {start_time} --end {end_time}"
         result = subprocess.check_output(
             rrd_xport_command,
             shell=True
@@ -202,8 +202,11 @@ class RRD_parser:
 
         json_result = json.dumps(xmltodict.parse(result), indent=4)
 
-        # replace rrdtool v key with the ds
-        replace_val = "\""+ds.lower()+"\": "
+        # replace rrdtool v key with the ds, append consolidation suffix if not AVERAGE
+        if consolidation == "AVERAGE":
+            replace_val = "\""+ds.lower()+"\": "
+        else:
+            replace_val = "\""+ds.lower()+"_"+consolidation.lower()+"\": "
         temp_result_one = re.sub("\"v\": ",  replace_val, json_result)
 
         return json.loads(temp_result_one)
@@ -264,46 +267,67 @@ class RRD_parser:
 
         collector = defaultdict(dict)
 
-        for d in DS_VALUES:
+        # Get actual step size from first export to determine consolidation functions
+        first_export = self.get_rrd_json(ds=DS_VALUES[0], ts=self.timeshift)
+        actual_step = int(first_export["xport"]["meta"]["step"])
+        
+        # Determine consolidation functions to use based on actual step size
+        consolidation_functions = ["AVERAGE"]
+        if actual_step > 300:
+            consolidation_functions.append("MAX")
+        
+        for d_idx, d in enumerate(DS_VALUES):
+                
             if self.baseline:
-                baseline_data = self.get_baseline(d)
-                means, std_devs = self.calculate_baseline_stats(baseline_data, d.lower())
+                for cf in consolidation_functions:
+                    baseline_data = self.get_baseline(d, cf)
+                    key_name = d.lower() if cf == "AVERAGE" else d.lower() + "_" + cf.lower()
+                    means, std_devs = self.calculate_baseline_stats(baseline_data, key_name)
 
-                for s in (means, std_devs):
-                    master_result["meta"]["start"] = datetime.datetime.fromtimestamp(
-                        int(s["xport"]["meta"]["start"])
-                    ).strftime(self.time_format)
-                    master_result["meta"]["step"] = s["xport"]["meta"]["step"]
-                    master_result["meta"]["end"] = datetime.datetime.fromtimestamp(
-                        int(s["xport"]["meta"]["end"])
-                    ).strftime(self.time_format)
-                    master_result["meta"]["rows"] = 0
-                    master_result["meta"]["data_sources"].append(
-                        s["xport"]["meta"]["legend"]["entry"]
-                    )
+                    for s in (means, std_devs):
+                        master_result["meta"]["start"] = datetime.datetime.fromtimestamp(
+                            int(s["xport"]["meta"]["start"])
+                        ).strftime(self.time_format)
+                        master_result["meta"]["step"] = s["xport"]["meta"]["step"]
+                        master_result["meta"]["end"] = datetime.datetime.fromtimestamp(
+                            int(s["xport"]["meta"]["end"])
+                        ).strftime(self.time_format)
+                        master_result["meta"]["rows"] = 0
+                        master_result["meta"]["data_sources"].append(
+                            s["xport"]["meta"]["legend"]["entry"]
+                        )
 
-                    for collectible in chain(
-                        master_result["data"], s["xport"]["data"]["row"]
-                    ):
-                        collector[collectible["t"]].update(collectible.items())
+                        for collectible in chain(
+                            master_result["data"], s["xport"]["data"]["row"]
+                        ):
+                            collector[collectible["t"]].update(collectible.items())
 
-            r = self.get_rrd_json(ds=d, ts=self.timeshift)
-            master_result["meta"]["start"] = datetime.datetime.fromtimestamp(
-                int(r["xport"]["meta"]["start"])
-            ).strftime(self.time_format)
-            master_result["meta"]["step"] = r["xport"]["meta"]["step"]
-            master_result["meta"]["end"] = datetime.datetime.fromtimestamp(
-                int(r["xport"]["meta"]["end"])
-            ).strftime(self.time_format)
-            master_result["meta"]["rows"] = 0
-            master_result["meta"]["data_sources"].append(
-                r["xport"]["meta"]["legend"]["entry"]
-            )
+            for cf in consolidation_functions:
+                # Use already-fetched data for first datasource with AVERAGE consolidation
+                if d_idx == 0 and cf == "AVERAGE":
+                    r = first_export
+                else:
+                    r = self.get_rrd_json(ds=d, ts=self.timeshift, consolidation=cf)
+                master_result["meta"]["start"] = datetime.datetime.fromtimestamp(
+                    int(r["xport"]["meta"]["start"])
+                ).strftime(self.time_format)
+                master_result["meta"]["step"] = r["xport"]["meta"]["step"]
+                master_result["meta"]["end"] = datetime.datetime.fromtimestamp(
+                    int(r["xport"]["meta"]["end"])
+                ).strftime(self.time_format)
+                master_result["meta"]["rows"] = 0
+                
+                # Use proper field name based on consolidation function
+                if cf == "AVERAGE":
+                    field_name = d
+                else:
+                    field_name = d + "_" + cf
+                master_result["meta"]["data_sources"].append(field_name)
 
-            for collectible in chain(
-                master_result["data"], r["xport"]["data"]["row"]
-                                    ):
-                collector[collectible["t"]].update(collectible.items())
+                for collectible in chain(
+                    master_result["data"], r["xport"]["data"]["row"]
+                                        ):
+                    collector[collectible["t"]].update(collectible.items())
 
         # combine objs, add row_count
         combined_list = list(collector.values())
